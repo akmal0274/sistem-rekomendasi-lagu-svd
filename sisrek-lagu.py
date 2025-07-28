@@ -3,7 +3,7 @@ import streamlit_authenticator as stauth
 from streamlit_authenticator.utilities.hasher import Hasher
 import pandas as pd
 import os
-from surprise import SVD, Dataset, Reader
+from surprise import SVD, Dataset, Reader, accuracy
 from surprise.model_selection import train_test_split
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
@@ -55,138 +55,118 @@ def build_credentials(df_users):
     }
 
 def content_based_recommendation(user_id, songs_df, user_likes_df, top_n=10):
-    """Fixed content-based recommendation with proper similarity calculation"""
     print(f"CBF: Processing for user {user_id}")
     
-    # Get liked songs for this user
-    liked_songs = user_likes_df[user_likes_df['user_id'] == user_id]['song'].tolist()
-    print(f"CBF: User liked {len(liked_songs)} songs: {liked_songs[:3]}...")
-    
-    if not liked_songs:
+    # Ambil song_id yang disukai user
+    liked_song_ids = user_likes_df[user_likes_df['user_id'] == user_id]['song_id'].tolist()
+    print(f"CBF: User liked {len(liked_song_ids)} songs: {liked_song_ids[:3]}...")
+
+    if not liked_song_ids:
         print("CBF: No liked songs found")
         return pd.DataFrame()
-    
-    # Create a copy to avoid modifying original dataframe
+
     songs_copy = songs_df.copy()
-    
-    # Get features for liked songs
-    liked_features = songs_copy[songs_copy['song'].isin(liked_songs)]
-    
+    liked_features = songs_copy[songs_copy['song_id'].isin(liked_song_ids)]
+
     if liked_features.empty:
         print("CBF: No matching features found for liked songs")
         return pd.DataFrame()
-    
-    # Feature columns (make sure these exist in your dataset)
+
     feature_cols = ['danceability', 'energy', 'loudness', 'speechiness', 'acousticness',
                     'instrumentalness', 'liveness', 'valence', 'tempo']
     
-    # Check if all feature columns exist
-    missing_cols = [col for col in feature_cols if col not in songs_copy.columns]
-    if missing_cols:
-        print(f"CBF: Missing columns: {missing_cols}")
-        # Use only available columns
-        feature_cols = [col for col in feature_cols if col in songs_copy.columns]
-    
+    feature_cols = [col for col in feature_cols if col in songs_copy.columns]
     print(f"CBF: Using features: {feature_cols}")
-    
-    # Normalize features
+
     scaler = StandardScaler()
     all_features_scaled = scaler.fit_transform(songs_copy[feature_cols])
     liked_features_scaled = scaler.transform(liked_features[feature_cols])
-    
-    # Create user profile (average of liked songs)
+
+    # Profil user: rata-rata fitur lagu yang disukai
     user_profile = liked_features_scaled.mean(axis=0).reshape(1, -1)
-    print(f"CBF: User profile shape: {user_profile.shape}")
-    
-    # Calculate cosine similarity
     similarities = cosine_similarity(user_profile, all_features_scaled)[0]
-    print(f"CBF: Similarity range: {similarities.min():.4f} to {similarities.max():.4f}")
-    
-    # Add similarities to dataframe
+
     songs_copy['similarity'] = similarities
-    
-    # Filter out already liked songs and get top recommendations
-    recommendations = songs_copy[~songs_copy['song'].isin(liked_songs)].copy()
+
+    # Hindari lagu yang sudah disukai
+    recommendations = songs_copy[~songs_copy['song_id'].isin(liked_song_ids)].copy()
     recommendations = recommendations.sort_values(by='similarity', ascending=False)
-    
-    # Get top N recommendations
-    top_recs = recommendations[['song', 'artist', 'similarity']].head(top_n)
+
+    # Ambil top-N rekomendasi
+    top_recs = recommendations[['song_id', 'song', 'artist', 'similarity']].head(top_n)
     top_recs = top_recs.rename(columns={"similarity": "estimated_rating"})
-    
+
     print(f"CBF: Generated {len(top_recs)} recommendations")
     print(f"CBF: Score range: {top_recs['estimated_rating'].min():.4f} to {top_recs['estimated_rating'].max():.4f}")
-    
+
     return top_recs
 
+
+
 def collaborative_filtering_recommendation(user_id, df_songs, user_likes, top_n=10):
-    """Fixed collaborative filtering with better error handling"""
     print(f"CF: Processing for user {user_id}")
     
-    # Check if we have enough data for collaborative filtering
     unique_users = user_likes['user_id'].nunique()
-    unique_songs = user_likes['song'].nunique()
-    
+    unique_songs = user_likes['song_id'].nunique()
     print(f"CF: Dataset has {unique_users} users and {unique_songs} songs")
     
     if unique_users < 2 or unique_songs < 2:
         print("CF: Not enough data for collaborative filtering")
         return pd.DataFrame()
-    
-    # Prepare rating data
+
     df_ratings = user_likes.copy()
-    df_ratings["rating"] = 1.0  # Binary rating (liked = 1)
-    
-    # Add some noise to ratings to create variation
-    # This helps when all ratings are the same
-    np.random.seed(42)  # For reproducibility
+    df_ratings["rating"] = 1.0
+
+    np.random.seed(42)
     noise = np.random.normal(0, 0.1, len(df_ratings))
-    df_ratings["rating"] = df_ratings["rating"] + noise
-    df_ratings["rating"] = df_ratings["rating"].clip(0.1, 1.0)  # Keep in valid range
-    
-    # Create Surprise dataset
+    df_ratings["rating"] += noise
+    df_ratings["rating"] = df_ratings["rating"].clip(0.1, 1.0)
+
+    # Gunakan song_id di Surprise
     reader = Reader(rating_scale=(0.1, 1.0))
-    data = Dataset.load_from_df(df_ratings[["user_id", "song", "rating"]], reader)
-    
-    # Split data
+    data = Dataset.load_from_df(df_ratings[["user_id", "song_id", "rating"]], reader)
     trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
-    
-    # Train SVD model
+
     model = SVD(random_state=42, n_factors=10, n_epochs=20)
     model.fit(trainset)
+
+    # 💡 Evaluasi MAE dan RMSE
+    predictions = model.test(testset)
+    mae = accuracy.mae(predictions, verbose=False)
+    rmse = accuracy.rmse(predictions, verbose=False)
+    print(f"CF: Evaluation - MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+    user_liked_song_ids = set(user_likes[user_likes["user_id"] == user_id]["song_id"])
+    all_song_ids = set(df_songs["song_id"])
+    unseen_song_ids = list(all_song_ids - user_liked_song_ids)
+
+    print(f"CF: Predicting for {len(unseen_song_ids)} unseen songs")
+
+    recommendations = []
+    for song_id in unseen_song_ids:
+        pred = model.predict(user_id, song_id)
+        recommendations.append((song_id, pred.est))
+
+    recommendations.sort(key=lambda x: x[1], reverse=True)
+    top_predictions = recommendations[:top_n]
+
+    rec_df = pd.DataFrame(top_predictions, columns=["song_id", "estimated_rating"])
     
-    # Get songs user hasn't liked
-    user_liked_songs = set(user_likes[user_likes["user_id"] == user_id]["song"])
-    all_songs = set(df_songs["song"])
-    unseen_songs = list(all_songs - user_liked_songs)
-    
-    print(f"CF: Predicting for {len(unseen_songs)} unseen songs")
-    
-    # Predict ratings for unseen songs
-    predictions = []
-    for song in unseen_songs:
-        pred = model.predict(user_id, song)
-        predictions.append((song, pred.est))
-    
-    # Sort by predicted rating
-    predictions.sort(key=lambda x: x[1], reverse=True)
-    
-    # Get top N
-    top_predictions = predictions[:top_n]
-    
-    # Create dataframe
-    rec_df = pd.DataFrame(top_predictions, columns=["song", "estimated_rating"])
-    
-    # Add artist information
-    final_recs = pd.merge(rec_df, df_songs[["song", "artist"]], on="song", how="left")
-    
+    # Gabungkan dengan info lagu
+    final_recs = pd.merge(rec_df, df_songs[["song_id", "song", "artist"]], on="song_id", how="left")
+
     print(f"CF: Generated {len(final_recs)} recommendations")
     if not final_recs.empty:
         print(f"CF: Score range: {final_recs['estimated_rating'].min():.4f} to {final_recs['estimated_rating'].max():.4f}")
-    
+
+    # Tambahkan evaluasi ke dalam output (optional)
+    final_recs["MAE"] = mae
+    final_recs["RMSE"] = rmse
+
     return final_recs
 
+
 def hybrid_filtering(user_id, df_songs, user_likes, top_n=10):
-    """Fixed hybrid filtering that ALWAYS returns consistent column structure"""
     print(f"HYBRID: Starting hybrid recommendation for user {user_id}")
     
     # Get recommendations from both methods
@@ -195,127 +175,89 @@ def hybrid_filtering(user_id, df_songs, user_likes, top_n=10):
     
     print(f"HYBRID: CBF returned {len(cbf_recs)} recommendations")
     print(f"HYBRID: CF returned {len(cf_recs)} recommendations")
-    
-    # Handle fallback cases - ALWAYS ensure consistent column structure
+
+    # Ensure column consistency
     if cbf_recs.empty and cf_recs.empty:
         print("HYBRID: Both methods failed")
-        return pd.DataFrame(columns=['song', 'artist', 'hybrid_score', 'method'])
-    
-    elif cbf_recs.empty:
+        return pd.DataFrame(columns=['song_id', 'song', 'artist', 'hybrid_score', 'method'])
+
+    def fallback_result(df, method_label):
+        df = df.head(top_n).copy()
+        if 'estimated_rating' in df.columns:
+            df['hybrid_score'] = df['estimated_rating']
+        else:
+            df['hybrid_score'] = 0.5
+        df['method'] = method_label
+        return df[['song_id', 'song', 'artist', 'hybrid_score', 'method']].reset_index(drop=True)
+
+    if cbf_recs.empty:
         print("HYBRID: Using only CF recommendations")
-        cf_fallback = cf_recs.head(top_n).copy()
-        # Ensure we have the required columns
-        if 'estimated_rating' in cf_fallback.columns:
-            cf_fallback['hybrid_score'] = cf_fallback['estimated_rating']
-        else:
-            cf_fallback['hybrid_score'] = 0.5  # Default score
-        cf_fallback['method'] = 'cf_only'
-        # Return only the required columns in the correct order
-        return cf_fallback[['song', 'artist', 'hybrid_score', 'method']].reset_index(drop=True)
+        return fallback_result(cf_recs, 'cf_only')
     
-    elif cf_recs.empty:
+    if cf_recs.empty:
         print("HYBRID: Using only CBF recommendations")
-        cbf_fallback = cbf_recs.head(top_n).copy()
-        # Ensure we have the required columns
-        if 'estimated_rating' in cbf_fallback.columns:
-            cbf_fallback['hybrid_score'] = cbf_fallback['estimated_rating']
-        else:
-            cbf_fallback['hybrid_score'] = 0.5  # Default score
-        cbf_fallback['method'] = 'cbf_only'
-        # Return only the required columns in the correct order
-        return cbf_fallback[['song', 'artist', 'hybrid_score', 'method']].reset_index(drop=True)
-    
-    # Both methods have results - proceed with hybrid combination
-    print("HYBRID: Both methods have results, combining...")
-    
-    # Normalize scores to 0-1 range for fair combination
-    def normalize_scores(df, score_col):
-        if df.empty or df[score_col].std() == 0:
-            return df
-        df_copy = df.copy()
-        min_score = df_copy[score_col].min()
-        max_score = df_copy[score_col].max()
-        if max_score != min_score:
-            df_copy[score_col + '_normalized'] = (df_copy[score_col] - min_score) / (max_score - min_score)
-        else:
-            df_copy[score_col + '_normalized'] = 0.5  # Default middle value if all scores are the same
-        return df_copy
-    
+        return fallback_result(cbf_recs, 'cbf_only')
+
     # Normalize scores
+    def normalize_scores(df, score_col):
+        df = df.copy()
+        if df.empty or df[score_col].std() == 0:
+            df[score_col + '_normalized'] = 0.5
+        else:
+            min_score = df[score_col].min()
+            max_score = df[score_col].max()
+            if max_score == min_score:
+                df[score_col + '_normalized'] = 0.5
+            else:
+                df[score_col + '_normalized'] = (df[score_col] - min_score) / (max_score - min_score)
+        return df
+
     cbf_recs = normalize_scores(cbf_recs, 'estimated_rating')
     cf_recs = normalize_scores(cf_recs, 'estimated_rating')
-    
-    # Create dictionaries for easy lookup
-    cbf_scores = {}
-    cf_scores = {}
-    
-    if 'estimated_rating_normalized' in cbf_recs.columns:
-        cbf_scores = dict(zip(cbf_recs["song"], cbf_recs["estimated_rating_normalized"]))
-    else:
-        cbf_scores = dict(zip(cbf_recs["song"], cbf_recs["estimated_rating"]))
-    
-    if 'estimated_rating_normalized' in cf_recs.columns:
-        cf_scores = dict(zip(cf_recs["song"], cf_recs["estimated_rating_normalized"]))
-    else:
-        cf_scores = dict(zip(cf_recs["song"], cf_recs["estimated_rating"]))
-    
-    # Get all unique recommended songs
-    all_songs = set(cbf_scores.keys()).union(set(cf_scores.keys()))
-    print(f"HYBRID: Combining {len(all_songs)} unique songs")
-    
-    # Calculate hybrid scores with weighted combination
+
+    # Convert to dictionary for lookup
+    cbf_scores = dict(zip(cbf_recs["song_id"], cbf_recs["estimated_rating_normalized"]))
+    cf_scores = dict(zip(cf_recs["song_id"], cf_recs["estimated_rating_normalized"]))
+
+    # Combine all song_ids
+    all_song_ids = set(cbf_scores.keys()).union(cf_scores.keys())
+    print(f"HYBRID: Combining {len(all_song_ids)} unique song_ids")
+
+    # Weighted average
+    cbf_weight, cf_weight = 0.6, 0.4
     hybrid_scores = []
-    cbf_weight = 0.6  # Give slightly more weight to content-based
-    cf_weight = 0.4
-    
-    for song in all_songs:
-        cbf_score = cbf_scores.get(song, 0)
-        cf_score = cf_scores.get(song, 0)
-        
-        # Weighted average
-        if song in cbf_scores and song in cf_scores:
-            # Both methods recommend this song
-            hybrid_score = (cbf_weight * cbf_score) + (cf_weight * cf_score)
+    for song_id in all_song_ids:
+        cbf_score = cbf_scores.get(song_id, 0)
+        cf_score = cf_scores.get(song_id, 0)
+
+        if song_id in cbf_scores and song_id in cf_scores:
+            score = (cbf_weight * cbf_score) + (cf_weight * cf_score)
             method = "both"
-        elif song in cbf_scores:
-            # Only content-based recommends
-            hybrid_score = cbf_score * 0.8  # Slight penalty for single method
+        elif song_id in cbf_scores:
+            score = cbf_score * 0.8
             method = "cbf_only"
         else:
-            # Only collaborative filtering recommends
-            hybrid_score = cf_score * 0.8  # Slight penalty for single method
+            score = cf_score * 0.8
             method = "cf_only"
-        
-        hybrid_scores.append((song, hybrid_score, method))
-    
-    # Sort by hybrid score
+
+        hybrid_scores.append((song_id, score, method))
+
+    # Sort and prepare result
     hybrid_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # Get top N
     top_hybrid = hybrid_scores[:top_n]
-    
-    # Create result dataframe with EXACTLY the required structure
-    result_data = []
-    for song, score, method in top_hybrid:
-        result_data.append({
-            'song': song,
-            'hybrid_score': score,
-            'method': method
-        })
-    
-    hybrid_df = pd.DataFrame(result_data)
-    
-    # Add artist information
-    final_hybrid = pd.merge(hybrid_df, df_songs[["song", "artist"]], on="song", how="left")
-    
-    # ENSURE exact column order and structure
-    final_hybrid = final_hybrid[['song', 'artist', 'hybrid_score', 'method']].reset_index(drop=True)
-    
-    print(f"HYBRID: Final recommendations with columns: {list(final_hybrid.columns)}")
-    for i, row in final_hybrid.head().iterrows():
-        print(f"  {row['song']} - {row['artist']}: {row['hybrid_score']:.4f} ({row['method']})")
-    
-    return final_hybrid
+
+    # Merge with song info
+    top_hybrid_df = pd.DataFrame(top_hybrid, columns=["song_id", "hybrid_score", "method"])
+    merged = pd.merge(top_hybrid_df, df_songs[['song_id', 'song', 'artist']], on='song_id', how='left')
+
+    result = merged[['song_id', 'song', 'artist', 'hybrid_score', 'method']].reset_index(drop=True)
+
+    print(f"HYBRID: Final recommendations:")
+    for i, row in result.iterrows():
+        print(f"  {row['song_id']} - {row['song']} - {row['artist']}: {row['hybrid_score']:.4f} ({row['method']})")
+
+    return result
+
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -433,23 +375,37 @@ def handle_recommendations():
             if len(selected_songs) < 3:
                 st.warning("Pilih minimal 3 lagu untuk rekomendasi yang lebih baik.")
             elif selected_songs:
-                # Parse song and artist
+                # Pisahkan judul dan artis dari input pengguna
                 titles = [s.rsplit(" - ", 1)[0] for s in selected_songs]
                 artists = [s.rsplit(" - ", 1)[1] for s in selected_songs]
-                
-                # Create new likes dataframe
-                new_likes = pd.DataFrame({
-                    "user_id": [st.session_state["username"]] * len(selected_songs),
+
+                # Buat DataFrame dari input pengguna
+                new_likes_temp = pd.DataFrame({
                     "song": titles,
-                    "artist": artists,
-                    "rating": [1.0] * len(selected_songs)
+                    "artist": artists
                 })
-                
-                # Save to file
-                updated_likes = pd.concat([user_likes, new_likes], ignore_index=True)
+
+                # Gabungkan dengan songs_df untuk mendapatkan song_id
+                new_likes = pd.merge(new_likes_temp, df_songs[['song', 'artist', 'song_id']],
+                                    on=["song", "artist"], how="left")
+
+                # Tambahkan user_id dan rating
+                new_likes["user_id"] = st.session_state["username"]
+                new_likes["rating"] = 1.0
+
+                # Cek jika ada yang tidak ditemukan
+                if new_likes["song_id"].isna().any():
+                    st.warning("Beberapa lagu tidak ditemukan dalam database dan tidak disimpan.")
+                    st.write(new_likes[new_likes["song_id"].isna()][["song", "artist"]])
+
+                # Hanya simpan yang berhasil ditemukan
+                new_likes_clean = new_likes.dropna(subset=["song_id"])[["user_id", "song_id", "song", "artist", "rating"]]
+
+                # Gabungkan dengan data lama
+                updated_likes = pd.concat([user_likes, new_likes_clean], ignore_index=True)
                 os.makedirs("data", exist_ok=True)
                 updated_likes.to_csv(user_likes_path, index=False)
-                
+
                 st.success("Lagu favorit berhasil disimpan!")
                 st.balloons()
                 st.rerun()
@@ -535,6 +491,12 @@ def handle_recommendations():
                     cf_recs = collaborative_filtering_recommendation(st.session_state["username"], df_songs, user_likes)
                     if not cf_recs.empty:
                         st.subheader("👥 Collaborative Filtering Recommendations")
+                        column_mapping = {
+                            'song': 'Lagu',
+                            'artist': 'Artis',
+                            'estimated_rating': 'Score',
+                        }
+                        cf_recs = cf_recs.rename(columns={k: v for k, v in column_mapping.items() if k in cf_recs.columns})
                         st.dataframe(cf_recs.reset_index(drop=True), use_container_width=True)
                     else:
                         st.warning("Collaborative filtering failed because of insufficient data.")
